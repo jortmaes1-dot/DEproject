@@ -3,7 +3,7 @@ import pandas as pd
 url = "https://meteostat.p.rapidapi.com/stations/daily"
 
 # parameters gwn als voorbeeld 
-querystring = {"station":"10637","start":"2020-01-01","end":"2020-01-30"}
+querystring = {"station":"06447","start":"2017-01-01","end":"2021-12-31"}
 
 headers = {
 	"x-rapidapi-key": "36a3dc31e5msh88f23068f6e8389p1f439djsnbd2bdd68d59f",
