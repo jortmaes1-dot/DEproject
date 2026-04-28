@@ -1,5 +1,8 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from pathlib import Path
+from scipy import stats
 <<<<<<< HEAD
 from pathlib import Path
 
@@ -17,6 +20,27 @@ from scipy import stats
 # ============================================================
 # FINAL_ANALYSIS.PY
 # ============================================================
+# DOEL:
+# - daily_valence_summary.csv en weather.csv samenbrengen
+# - 2 extreme weergroepen definiëren:
+#     1. strict_rainy
+#     2. strict_sunny
+# - Vergelijken via BOXPLOTS voor:
+#     A. avg_valence         (gemiddelde positiviteit per dag)
+#     B. avg_energy          (gemiddelde energie per dag)
+#     C. share_sad_songs     (aandeel lage valence songs)
+#     D. share_low_energy    (aandeel lage energy songs)
+#     E. share_depressief    (aandeel lage valence + lage energy)
+# - Significantietest (Mann-Whitney U) per metric
+# - Samenvattende statistieken opslaan
+#
+# EXTREME WEERGROEPEN:
+# - strict_rainy_day = prcp >= 5.0 EN tsun <= q25
+# - strict_sunny_day = prcp < 1.0 EN tsun >= q75
+#
+# DREMPELWAARDEN (overeenkomen met main.py):
+# - SAD_THRESHOLD        = 0.40
+# - LOW_ENERGY_THRESHOLD = 0.50
 # DOEL:
 <<<<<<< HEAD
 # - daily_top200_valence_summary.csv combineren met weather.csv
@@ -43,6 +67,20 @@ from scipy import stats
 # - grafieken als PNG
 # ============================================================
 
+SPOTIFY_DAILY_FILE = "daily_valence_summary.csv"
+WEATHER_FILE = "weather.csv"
+
+OUTPUT_FINAL_DATASET = "final_dataset.csv"
+OUTPUT_EXTREME_DATASET = "extreme_weather_dataset.csv"
+OUTPUT_SUMMARY_EXTREME = "summary_strict_rainy_vs_strict_sunny.csv"
+
+STRICT_RAIN_THRESHOLD = 5.0
+DRY_FOR_SUNNY_THRESHOLD = 1.0
+COVERAGE_THRESHOLD = 0.70
+
+COLOR_RAINY = "#4C72B0"
+COLOR_SUNNY = "#DD8452"
+
 SPOTIFY_DAILY_FILE = "daily_top200_valence_summary.csv"
 WEATHER_FILE = "weather.csv"
 
@@ -55,9 +93,21 @@ SUNNY_RAIN_MAX = 0.5
 
 
 # ============================================================
+# STAP 1: BESTANDEN CONTROLEREN
 # HULPFUNCTIES
 # ============================================================
 
+if not Path(SPOTIFY_DAILY_FILE).exists():
+    raise FileNotFoundError(
+        f"Bestand niet gevonden: {SPOTIFY_DAILY_FILE}\n"
+        "Run eerst main.py."
+    )
+
+if not Path(WEATHER_FILE).exists():
+    raise FileNotFoundError(
+        f"Bestand niet gevonden: {WEATHER_FILE}\n"
+        "Run eerst weather_API.py."
+    )
 def safe_to_numeric(series):
     return pd.to_numeric(series, errors="coerce")
 
@@ -401,7 +451,10 @@ print(f"  share_depressief  : {has_share_depressief}")
 
 weather_small = weather[["date", "prcp", "tsun"]].copy()
 df = pd.merge(spotify, weather_small, on="date", how="inner")
+weather_small = weather[["date", "prcp", "tsun"]].copy()
+df = pd.merge(spotify, weather_small, on="date", how="inner")
 
+print("\nShape na merge:", df.shape)
 print("\nShape na merge:", df.shape)
 
 
