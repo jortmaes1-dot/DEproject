@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import re
 import unicodedata
 from pathlib import Path
@@ -7,29 +8,34 @@ from pathlib import Path
 # MAIN.PY
 # ============================================================
 # DOEL:
-# 1. Belgische Spotify Top 200 selecteren
-# 2. Valence koppelen
-# 3. Song-level output bewaren
-# 4. Dagelijkse valence-samenvatting maken
+# - Database to calculate popularity.csv inladen
+# - Belgische Spotify Top 200 selecteren
+# - Final database.csv inladen
+# - Valence koppelen aan elk nummer
+# - Per dag een globale Top 200 valence-samenvatting maken
+#
+# INPUT:
+# - Database to calculate popularity.csv
+# - Final database.csv
 #
 # OUTPUT:
 # - spotify_belgium_top200_with_valence.csv
-# - daily_top200_overview.csv
-# - daily_valence_summary.csv
+# - daily_top200_valence_summary.csv
 #
 # BELANGRIJK:
-# - datum wordt veilig genormaliseerd naar YYYY-MM-DD
-# - zo vermijden we de "eerste 12 dagen van de maand"-bug
+# - Dit script houdt rekening met rare datumformaten.
+# - Eerst wordt gematcht op track_id/url indien mogelijk.
+# - Daarna op title + artist.
+# - Daarna op title + first artist.
 # ============================================================
 
 CHARTS_FILE = "Database to calculate popularity.csv"
 FEATURES_FILE = "Final database.csv"
 
-COUNTRY_TARGET = "belgium"
-
 OUTPUT_SONG_LEVEL = "spotify_belgium_top200_with_valence.csv"
-OUTPUT_DAILY_OVERVIEW = "daily_top200_overview.csv"
-OUTPUT_DAILY_VALENCE = "daily_valence_summary.csv"
+OUTPUT_DAILY_SUMMARY = "daily_top200_valence_summary.csv"
+
+COUNTRY_TARGETS = ["belgium", "be", "belgie", "belgië", "belgique"]
 
 SAD_THRESHOLD = 0.40
 
@@ -70,29 +76,34 @@ def clean_text(value):
 
 def first_artist(value):
     text = clean_text(value)
+
     if not text:
         return ""
 
     parts = re.split(r"\s*(?:,|;|/| x | and )\s*", text)
-    return parts[0].strip() if parts else text
+
+    if parts:
+        return parts[0].strip()
+
+    return text
 
 
 def pick_column(columns, candidates, required=True):
     cols = list(columns)
-    candidates = [normalize_column_name(x) for x in candidates]
+    candidates = [normalize_column_name(c) for c in candidates]
 
-    for cand in candidates:
-        if cand in cols:
-            return cand
+    for candidate in candidates:
+        if candidate in cols:
+            return candidate
 
     for col in cols:
-        for cand in candidates:
-            if cand in col:
+        for candidate in candidates:
+            if candidate in col:
                 return col
 
     if required:
         raise ValueError(
-            f"Kon geen kolom vinden voor {candidates}.\n"
+            f"Kon geen kolom vinden voor: {candidates}\n"
             f"Beschikbare kolommen:\n{cols}"
         )
 
@@ -138,68 +149,60 @@ def clean_raw_date_string(value):
 
 
 def detect_date_order(values):
-    """
-    Probeert te bepalen of data zoals 03/04/2019
-    day-first of month-first zijn.
-    """
     dayfirst_score = 0
     monthfirst_score = 0
 
     for value in values.dropna().astype(str).head(5000):
         s = clean_raw_date_string(value)
+
         if not s:
             continue
 
-        m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
-        if not m:
+        match = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
+
+        if not match:
             continue
 
-        a = int(m.group(1))
-        b = int(m.group(2))
+        first = int(match.group(1))
+        second = int(match.group(2))
 
-        if a > 12 and b <= 12:
+        if first > 12 and second <= 12:
             dayfirst_score += 1
-        elif b > 12 and a <= 12:
+        elif second > 12 and first <= 12:
             monthfirst_score += 1
 
     if dayfirst_score >= monthfirst_score:
         return "dayfirst"
+
     return "monthfirst"
 
 
 def normalize_date_string(value, slash_order="dayfirst"):
-    """
-    Zet datum veilig om naar exact YYYY-MM-DD.
-    Ondersteunt:
-    - YYYY-MM-DD
-    - YYYY/MM/DD
-    - DD/MM/YYYY
-    - DD-MM-YYYY
-    - MM/DD/YYYY
-    - MM-DD-YYYY
-    """
     s = clean_raw_date_string(value)
 
     if not s:
         return None
 
     # YYYY-MM-DD of YYYY/MM/DD
-    m = re.fullmatch(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", s)
-    if m:
-        year = int(m.group(1))
-        month = int(m.group(2))
-        day = int(m.group(3))
+    match = re.fullmatch(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", s)
+
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
 
         if 1 <= month <= 12 and 1 <= day <= 31:
             return f"{year:04d}-{month:02d}-{day:02d}"
+
         return None
 
-    # DD/MM/YYYY of MM/DD/YYYY
-    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
-    if m:
-        first = int(m.group(1))
-        second = int(m.group(2))
-        year = int(m.group(3))
+    # DD-MM-YYYY of MM-DD-YYYY
+    match = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
+
+    if match:
+        first = int(match.group(1))
+        second = int(match.group(2))
+        year = int(match.group(3))
 
         if slash_order == "dayfirst":
             day = first
@@ -210,13 +213,70 @@ def normalize_date_string(value, slash_order="dayfirst"):
 
         if 1 <= month <= 12 and 1 <= day <= 31:
             return f"{year:04d}-{month:02d}-{day:02d}"
+
         return None
 
     return None
 
 
-def safe_sort_dates_as_text(df, date_col, rank_col):
-    return df.sort_values(by=[date_col, rank_col], kind="stable").reset_index(drop=True)
+def clean_numeric_series(series):
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce"
+    )
+
+
+def weighted_average(values, weights):
+    values = pd.Series(values)
+    weights = pd.Series(weights)
+
+    mask = values.notna() & weights.notna()
+    values = values[mask]
+    weights = weights[mask]
+
+    if len(values) == 0:
+        return np.nan
+
+    weight_sum = weights.sum()
+
+    if weight_sum == 0:
+        return np.nan
+
+    return (values * weights).sum() / weight_sum
+
+
+def weighted_share(boolean_series, weights):
+    boolean_series = pd.Series(boolean_series)
+    weights = pd.Series(weights)
+
+    mask = boolean_series.notna() & weights.notna()
+    boolean_series = boolean_series[mask]
+    weights = weights[mask]
+
+    if len(boolean_series) == 0:
+        return np.nan
+
+    weight_sum = weights.sum()
+
+    if weight_sum == 0:
+        return np.nan
+
+    return weights[boolean_series.astype(bool)].sum() / weight_sum
+
+
+def has_usable_streams(df, stream_col="streams"):
+    if stream_col not in df.columns:
+        return False
+
+    s = pd.to_numeric(df[stream_col], errors="coerce")
+
+    if s.notna().sum() == 0:
+        return False
+
+    if s.fillna(0).sum() <= 0:
+        return False
+
+    return True
 
 
 # ============================================================
@@ -241,25 +301,36 @@ print("-", FEATURES_FILE)
 
 
 # ============================================================
-# STAP 2: FEATURES / VALENCE INLADEN
+# STAP 2: FINAL DATABASE / VALENCE INLADEN
 # ============================================================
 
 features = pd.read_csv(FEATURES_FILE, low_memory=False)
 features.columns = [normalize_column_name(c) for c in features.columns]
 
-print("\nKolommen in valencebestand:")
+print("\nKolommen in Final database:")
 print(features.columns.tolist())
 
 valence_col = pick_column(features.columns, ["valence"])
-feature_title_col = pick_column(features.columns, ["track_name", "title", "name"], required=False)
-feature_artist_col = pick_column(features.columns, ["artists", "artist"], required=False)
+
+feature_title_col = pick_column(
+    features.columns,
+    ["track_name", "title", "name", "song_name"],
+    required=False
+)
+
+feature_artist_col = pick_column(
+    features.columns,
+    ["artists", "artist", "artist_name"],
+    required=False
+)
+
 feature_id_col = pick_column(
     features.columns,
     ["track_id", "spotify_id", "id", "url", "spotify_url", "track_url", "uri", "track_uri"],
     required=False
 )
 
-features["valence"] = pd.to_numeric(features[valence_col], errors="coerce")
+features["valence"] = clean_numeric_series(features[valence_col])
 
 if feature_id_col is not None:
     features["track_id"] = features[feature_id_col].apply(extract_track_id)
@@ -278,38 +349,52 @@ else:
     features["artist_clean"] = ""
     features["artist_first_clean"] = ""
 
-extra_audio_cols = []
-for col in ["danceability", "energy", "tempo", "acousticness", "instrumentalness", "liveness", "speechiness"]:
-    if col in features.columns:
-        features[col] = pd.to_numeric(features[col], errors="coerce")
-        extra_audio_cols.append(col)
+features_small = features[
+    ["track_id", "title_clean", "artist_clean", "artist_first_clean", "valence"]
+].copy()
 
-keep_cols = ["track_id", "title_clean", "artist_clean", "artist_first_clean", "valence"] + extra_audio_cols
-features_small = features[keep_cols].copy()
+features_small = features_small.dropna(subset=["valence"]).copy()
 
-features_by_id = features_small.dropna(subset=["track_id"]).drop_duplicates(subset=["track_id"])
-features_by_text = features_small[
-    (features_small["title_clean"] != "") & (features_small["artist_clean"] != "")
-].drop_duplicates(subset=["title_clean", "artist_clean"])
-features_by_first_artist = features_small[
-    (features_small["title_clean"] != "") & (features_small["artist_first_clean"] != "")
-].drop_duplicates(subset=["title_clean", "artist_first_clean"])
+features_by_id = (
+    features_small
+    .dropna(subset=["track_id"])
+    .drop_duplicates(subset=["track_id"])
+    .copy()
+)
+
+features_by_text = (
+    features_small[
+        (features_small["title_clean"] != "") &
+        (features_small["artist_clean"] != "")
+    ]
+    .drop_duplicates(subset=["title_clean", "artist_clean"])
+    .copy()
+)
+
+features_by_first_artist = (
+    features_small[
+        (features_small["title_clean"] != "") &
+        (features_small["artist_first_clean"] != "")
+    ]
+    .drop_duplicates(subset=["title_clean", "artist_first_clean"])
+    .copy()
+)
 
 print("\nFeatures klaar:")
+print("Rijen met valence:", len(features_small))
 print("Rijen met track_id:", len(features_by_id))
 print("Rijen met title + artist:", len(features_by_text))
 print("Rijen met title + first artist:", len(features_by_first_artist))
-print("Rijen met valence:", features_small["valence"].notna().sum())
 
 
 # ============================================================
-# STAP 3: CHARTBESTAND INLADEN
+# STAP 3: DATABASE TO CALCULATE POPULARITY INLADEN
 # ============================================================
 
 charts = pd.read_csv(CHARTS_FILE, low_memory=False)
 charts.columns = [normalize_column_name(c) for c in charts.columns]
 
-print("\nKolommen in chartbestand:")
+print("\nKolommen in Database to calculate popularity:")
 print(charts.columns.tolist())
 
 date_col = pick_column(charts.columns, ["date", "day"])
@@ -318,13 +403,23 @@ country_col = pick_column(charts.columns, ["country", "region"])
 title_col = pick_column(charts.columns, ["title", "track_name", "name"])
 artist_col = pick_column(charts.columns, ["artist", "artists"])
 
+chart_type_col = pick_column(
+    charts.columns,
+    ["chart", "chart_type", "type"],
+    required=False
+)
+
+stream_col = pick_column(
+    charts.columns,
+    ["streams", "stream", "num_streams", "stream_count"],
+    required=False
+)
+
 chart_id_col = pick_column(
     charts.columns,
     ["track_id", "spotify_id", "id", "url", "spotify_url", "track_url", "uri", "track_uri"],
     required=False
 )
-
-streams_col = pick_column(charts.columns, ["streams", "stream"], required=False)
 
 print("\nGebruikte chartkolommen:")
 print("date:", date_col)
@@ -332,38 +427,59 @@ print("rank:", rank_col)
 print("country:", country_col)
 print("title:", title_col)
 print("artist:", artist_col)
+print("chart/type:", chart_type_col)
+print("streams:", stream_col)
 print("track_id/url:", chart_id_col)
-print("streams:", streams_col)
 
 print("\nEerste 20 ruwe datumwaarden:")
 print(charts[date_col].head(20).to_string(index=False))
 
 
 # ============================================================
-# STAP 4: DATUM VEILIG NORMALISEREN
+# STAP 4: DATUM CLEANEN
 # ============================================================
 
 slash_order = detect_date_order(charts[date_col])
 print("\nGedetecteerde slash-volgorde:", slash_order)
 
-charts["date"] = charts[date_col].apply(lambda x: normalize_date_string(x, slash_order=slash_order))
-charts[rank_col] = pd.to_numeric(charts[rank_col], errors="coerce")
-charts[country_col] = charts[country_col].astype(str).str.strip().str.lower()
+charts["date"] = charts[date_col].apply(
+    lambda x: normalize_date_string(x, slash_order=slash_order)
+)
 
-if streams_col is not None:
-    charts["streams"] = pd.to_numeric(charts[streams_col], errors="coerce")
+charts["date_dt"] = pd.to_datetime(charts["date"], errors="coerce")
+
+charts[rank_col] = clean_numeric_series(charts[rank_col])
+charts["country_clean"] = charts[country_col].astype(str).apply(clean_text)
+
+charts = charts.dropna(subset=["date", "date_dt", rank_col]).copy()
 
 print("\nEerste 20 genormaliseerde datumwaarden:")
 print(charts["date"].head(20).to_string(index=False))
 
-charts = charts.dropna(subset=["date", rank_col]).copy()
 
-# Alleen België
-charts = charts[charts[country_col] == COUNTRY_TARGET].copy()
+# ============================================================
+# STAP 5: FILTEREN OP BELGIË + TOP 200
+# ============================================================
 
-# Alleen Top 200
+charts = charts[charts["country_clean"].isin(COUNTRY_TARGETS)].copy()
+
+if chart_type_col is not None:
+    chart_type_clean = charts[chart_type_col].astype(str).str.lower().str.strip()
+
+    top_mask = (
+        chart_type_clean.str.contains("top", na=False) &
+        ~chart_type_clean.str.contains("viral", na=False)
+    )
+
+    if top_mask.sum() > 0:
+        charts = charts[top_mask].copy()
+        print("\nChart-type filter toegepast: top chart, geen viral chart.")
+    else:
+        print("\nGeen bruikbare chart-type filter gevonden. Er wordt enkel op rank 1-200 gefilterd.")
+
 charts = charts[charts[rank_col].between(1, 200)].copy()
 
+charts["rank"] = charts[rank_col].astype(int)
 charts["title_clean"] = charts[title_col].apply(clean_text)
 charts["artist_clean"] = charts[artist_col].apply(clean_text)
 charts["artist_first_clean"] = charts[artist_col].apply(first_artist)
@@ -373,223 +489,183 @@ if chart_id_col is not None:
 else:
     charts["track_id"] = None
 
-charts["rank"] = charts[rank_col]
+if stream_col is not None:
+    charts["streams"] = clean_numeric_series(charts[stream_col])
+else:
+    charts["streams"] = np.nan
 
-print("\nNa filtering:")
+charts["weight_rank_linear"] = 201 - charts["rank"]
+
+print("\nNa filtering op België + Top 200:")
 print("Aantal rijen:", len(charts))
-print("Aantal unieke datumstrings:", charts["date"].nunique())
-print("Eerste 20 datumstrings:")
-print(charts["date"].drop_duplicates().sort_values().head(20).to_string(index=False))
-print("Laatste 20 datumstrings:")
-print(charts["date"].drop_duplicates().sort_values().tail(20).to_string(index=False))
+print("Aantal unieke dagen:", charts["date"].nunique())
+print("Minimum datum:", charts["date"].min())
+print("Maximum datum:", charts["date"].max())
 
-daily_counts = charts.groupby("date").size().sort_index()
-
-print("\nRijen per dag:")
-print(daily_counts.describe())
-
-print("\nDagen met niet exact 200 rijen:")
-print(daily_counts[daily_counts != 200].head(20))
-print("Aantal zulke dagen:", (daily_counts != 200).sum())
+if charts.empty:
+    raise ValueError(
+        "Geen rijen over na filtering op België + Top 200.\n"
+        "Controleer country/region, chart-type en rankkolommen."
+    )
 
 
 # ============================================================
-# STAP 5: MERGEN MET VALENCE
+# STAP 6: VALENCE KOPPELEN
 # ============================================================
 
-song_level = charts.copy()
-song_level["merge_method"] = None
+song_level = charts.copy().reset_index(drop=True)
+song_level["valence"] = np.nan
+song_level["merge_method"] = pd.NA
 
-audio_cols = ["valence"] + extra_audio_cols
-for col in audio_cols:
-    song_level[col] = pd.NA
-
-# 1. Eerst via track_id
+# 1. Match via track_id
 if song_level["track_id"].notna().any() and len(features_by_id) > 0:
-    merged_id = song_level.merge(
-        features_by_id[["track_id"] + audio_cols],
-        on="track_id",
-        how="left",
-        suffixes=("", "_new")
-    )
+    id_map = features_by_id.set_index("track_id")["valence"].to_dict()
+    matched_values = song_level["track_id"].map(id_map)
+    matched_mask = matched_values.notna()
 
-    matched = merged_id["valence_new"].notna()
+    song_level.loc[matched_mask, "valence"] = matched_values[matched_mask]
+    song_level.loc[matched_mask, "merge_method"] = "track_id"
 
-    for col in audio_cols:
-        merged_id.loc[matched, col] = merged_id.loc[matched, f"{col}_new"]
-        merged_id.drop(columns=[f"{col}_new"], inplace=True)
+# 2. Match via title + artist
+if len(features_by_text) > 0:
+    text_map = features_by_text.set_index(["title_clean", "artist_clean"])["valence"].to_dict()
 
-    merged_id.loc[matched, "merge_method"] = "track_id"
-    song_level = merged_id
+    unmatched_mask = song_level["valence"].isna()
 
-# 2. Dan via title + artist
-unmatched_mask = song_level["valence"].isna()
-if unmatched_mask.any():
-    to_match = song_level.loc[unmatched_mask].merge(
-        features_by_text[["title_clean", "artist_clean"] + audio_cols],
-        on=["title_clean", "artist_clean"],
-        how="left",
-        suffixes=("", "_new")
-    )
+    for idx, row in song_level.loc[unmatched_mask].iterrows():
+        key = (row["title_clean"], row["artist_clean"])
+        value = text_map.get(key, np.nan)
 
-    matched_rows = to_match["valence_new"].notna().values
+        if pd.notna(value):
+            song_level.at[idx, "valence"] = value
+            song_level.at[idx, "merge_method"] = "title_artist"
 
-    if matched_rows.any():
-        idx = song_level.loc[unmatched_mask].index[matched_rows]
+# 3. Match via title + first artist
+if len(features_by_first_artist) > 0:
+    first_artist_map = features_by_first_artist.set_index(
+        ["title_clean", "artist_first_clean"]
+    )["valence"].to_dict()
 
-        for col in audio_cols:
-            song_level.loc[idx, col] = to_match.loc[matched_rows, f"{col}_new"].values
+    unmatched_mask = song_level["valence"].isna()
 
-        song_level.loc[idx, "merge_method"] = "title_artist"
+    for idx, row in song_level.loc[unmatched_mask].iterrows():
+        key = (row["title_clean"], row["artist_first_clean"])
+        value = first_artist_map.get(key, np.nan)
 
-# 3. Dan via title + first artist
-unmatched_mask = song_level["valence"].isna()
-if unmatched_mask.any():
-    to_match = song_level.loc[unmatched_mask].merge(
-        features_by_first_artist[["title_clean", "artist_first_clean"] + audio_cols],
-        on=["title_clean", "artist_first_clean"],
-        how="left",
-        suffixes=("", "_new")
-    )
+        if pd.notna(value):
+            song_level.at[idx, "valence"] = value
+            song_level.at[idx, "merge_method"] = "title_first_artist"
 
-    matched_rows = to_match["valence_new"].notna().values
+song_level["valence"] = pd.to_numeric(song_level["valence"], errors="coerce")
+song_level["sad_song"] = song_level["valence"] <= SAD_THRESHOLD
 
-    if matched_rows.any():
-        idx = song_level.loc[unmatched_mask].index[matched_rows]
+song_level = song_level.sort_values(
+    ["date_dt", "rank"],
+    kind="stable"
+).reset_index(drop=True)
 
-        for col in audio_cols:
-            song_level.loc[idx, col] = to_match.loc[matched_rows, f"{col}_new"].values
+streams_available = has_usable_streams(song_level, "streams")
 
-        song_level.loc[idx, "merge_method"] = "title_first_artist"
-
-for col in audio_cols:
-    song_level[col] = pd.to_numeric(song_level[col], errors="coerce")
-
-
-# ============================================================
-# STAP 6: CONTROLE OP MERGE
-# ============================================================
-
-song_level = safe_sort_dates_as_text(song_level, "date", "rank")
-
-total_rows = len(song_level)
-matched_rows = song_level["valence"].notna().sum()
-match_rate = matched_rows / total_rows * 100 if total_rows else 0
-
-print("\nMergecontrole:")
-print("Totaal aantal rijen:", total_rows)
-print("Aantal rijen met valence:", matched_rows)
-print("Match rate:", round(match_rate, 2), "%")
+print("\nMergecontrole valence:")
+print("Totaal aantal rijen:", len(song_level))
+print("Aantal rijen met valence:", song_level["valence"].notna().sum())
+print("Match rate:", round(song_level["valence"].notna().mean() * 100, 2), "%")
 
 print("\nMatch methodes:")
 print(song_level["merge_method"].value_counts(dropna=False))
 
-daily_coverage = song_level.groupby("date").agg(
-    top200_rows=("rank", "count"),
-    tracks_with_valence=("valence", lambda x: x.notna().sum())
-).reset_index()
-
-daily_coverage["valence_coverage"] = (
-    daily_coverage["tracks_with_valence"] / daily_coverage["top200_rows"]
-)
-
-daily_coverage = daily_coverage.sort_values("date", kind="stable").reset_index(drop=True)
-
-print("\nDaily overview:")
-print(daily_coverage.head(20).to_string(index=False))
+print("\nStreams beschikbaar:", streams_available)
 
 
 # ============================================================
-# STAP 7: SONG-LEVEL EN OVERVIEW OPSLAAN
+# STAP 7: SONG-LEVEL OPSLAAN
 # ============================================================
 
 song_level.to_csv(OUTPUT_SONG_LEVEL, index=False)
-daily_coverage.to_csv(OUTPUT_DAILY_OVERVIEW, index=False)
 
-print("\nBestanden opgeslagen:")
+print("\nSong-level bestand opgeslagen:")
 print("-", OUTPUT_SONG_LEVEL)
-print("-", OUTPUT_DAILY_OVERVIEW)
 
 
 # ============================================================
-# STAP 8: DAGELIJKSE VALENCE-SAMENVATTING
+# STAP 8: DAGELIJKSE TOP 200 SAMENVATTING
 # ============================================================
+
+daily_coverage = (
+    song_level
+    .groupby("date")
+    .agg(
+        top200_rows=("rank", "count"),
+        tracks_with_valence=("valence", lambda x: x.notna().sum()),
+        total_rank_weight_all=("weight_rank_linear", "sum"),
+        total_streams_all=("streams", "sum")
+    )
+    .reset_index()
+)
+
+daily_coverage["valence_coverage"] = (
+    daily_coverage["tracks_with_valence"] /
+    daily_coverage["top200_rows"]
+)
 
 usable = song_level.dropna(subset=["date", "valence"]).copy()
-usable["sad_song"] = usable["valence"] <= SAD_THRESHOLD
 
-daily_metrics = usable.groupby("date").agg(
-    avg_valence=("valence", "mean"),
-    median_valence=("valence", "median"),
-    std_valence=("valence", "std"),
-    min_valence=("valence", "min"),
-    max_valence=("valence", "max"),
-    sad_songs_count=("sad_song", "sum")
-).reset_index()
+daily_rows = []
 
-daily_metrics["sad_songs_count"] = daily_metrics["sad_songs_count"].astype(int)
+for date_value, group in usable.groupby("date"):
+    row = {
+        "date": date_value,
+        "matched_rows": len(group),
+        "avg_valence": group["valence"].mean(),
+        "median_valence": group["valence"].median(),
+        "std_valence": group["valence"].std(),
+        "min_valence": group["valence"].min(),
+        "max_valence": group["valence"].max(),
+        "sad_songs_count": int(group["sad_song"].sum()),
+        "share_sad_songs": group["sad_song"].mean(),
+        "weighted_avg_valence_rank": weighted_average(group["valence"], group["weight_rank_linear"]),
+        "weighted_sad_share_rank": weighted_share(group["sad_song"], group["weight_rank_linear"])
+    }
 
-daily_valence_summary = pd.merge(
+    if streams_available:
+        row["weighted_avg_valence_streams"] = weighted_average(group["valence"], group["streams"])
+        row["weighted_sad_share_streams"] = weighted_share(group["sad_song"], group["streams"])
+    else:
+        row["weighted_avg_valence_streams"] = np.nan
+        row["weighted_sad_share_streams"] = np.nan
+
+    daily_rows.append(row)
+
+daily_metrics = pd.DataFrame(daily_rows)
+
+daily_summary = pd.merge(
     daily_coverage,
     daily_metrics,
     on="date",
     how="left"
 )
 
-daily_valence_summary["share_sad_songs"] = (
-    daily_valence_summary["sad_songs_count"] / daily_valence_summary["tracks_with_valence"]
-)
+if streams_available:
+    daily_summary["primary_valence_metric"] = "weighted_avg_valence_streams"
+    daily_summary["primary_sad_metric"] = "weighted_sad_share_streams"
+else:
+    daily_summary["primary_valence_metric"] = "weighted_avg_valence_rank"
+    daily_summary["primary_sad_metric"] = "weighted_sad_share_rank"
 
-# Weighted metrics als streams bestaat
-if "streams" in song_level.columns:
-    stream_usable = song_level.dropna(subset=["date", "valence", "streams"]).copy()
-    stream_usable = stream_usable[stream_usable["streams"] >= 0].copy()
+daily_summary = daily_summary.sort_values("date").reset_index(drop=True)
 
-    if not stream_usable.empty:
-        weighted_rows = []
+daily_summary.to_csv(OUTPUT_DAILY_SUMMARY, index=False)
 
-        for date_value, group in stream_usable.groupby("date"):
-            total_streams = group["streams"].sum()
+print("\nDaily summary opgeslagen:")
+print("-", OUTPUT_DAILY_SUMMARY)
 
-            if total_streams > 0:
-                weighted_avg_valence = (group["valence"] * group["streams"]).sum() / total_streams
-                sad_streams = group.loc[group["valence"] <= SAD_THRESHOLD, "streams"].sum()
-                share_sad_streams = sad_streams / total_streams
-            else:
-                weighted_avg_valence = pd.NA
-                sad_streams = pd.NA
-                share_sad_streams = pd.NA
+print("\nEerste 10 rijen:")
+print(daily_summary.head(10).to_string(index=False))
 
-            weighted_rows.append({
-                "date": date_value,
-                "total_streams": total_streams,
-                "sad_streams": sad_streams,
-                "weighted_avg_valence": weighted_avg_valence,
-                "share_sad_streams": share_sad_streams
-            })
+print("\nDatumbereik:")
+print(daily_summary["date"].min(), "tot", daily_summary["date"].max())
 
-        weighted_df = pd.DataFrame(weighted_rows)
-
-        daily_valence_summary = pd.merge(
-            daily_valence_summary,
-            weighted_df,
-            on="date",
-            how="left"
-        )
-
-daily_valence_summary = daily_valence_summary.sort_values("date").reset_index(drop=True)
-daily_valence_summary.to_csv(OUTPUT_DAILY_VALENCE, index=False)
-
-print("\nBestand opgeslagen:")
-print("-", OUTPUT_DAILY_VALENCE)
-
-print("\nDatumbereik daily valence summary:")
-print(daily_valence_summary["date"].min(), "tot", daily_valence_summary["date"].max())
-
-print("\nAantal unieke dagen daily valence summary:")
-print(daily_valence_summary["date"].nunique())
-
-print("\nGebruikte sad-definitie:")
-print(f"sad_song = valence <= {SAD_THRESHOLD}")
+print("\nAantal unieke dagen:")
+print(daily_summary["date"].nunique())
 
 print("\nKlaar.")
