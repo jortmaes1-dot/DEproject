@@ -1,382 +1,300 @@
-import time
+import io
 import requests
 import pandas as pd
+from pathlib import Path
 
 # ============================================================
 # WEATHER_API.PY
 # ============================================================
 # DOEL:
-# We halen dagelijkse weerdata op via Meteostat / RapidAPI.
+# - Daily weather data ophalen van KMI / RMI open data
+# - Analyseperiode automatisch afleiden uit daily_valence_summary.csv
+# - Requests in JAARBLOKKEN doen om truncatie van grote WFS-calls te vermijden
+# - Per dag een Belgisch gemiddelde maken over alle stations
+# - Output opslaan als weather.csv met:
+#     date, prcp, tsun
 #
-# Input:
+# INPUT:
 # - daily_valence_summary.csv
 #
-# Output:
+# OUTPUT:
 # - weather.csv
-# - station_candidate_coverage.csv
 #
-# Belangrijkste weerkolommen:
-# - prcp = neerslag in mm
-# - tsun = zonneschijnduur in minuten
-# - tavg = gemiddelde temperatuur
-# - tmin = minimumtemperatuur
-# - tmax = maximumtemperatuur
-# - wspd = gemiddelde windsnelheid
-#
-# We zoeken automatisch weerstations rond Brussel.
-# Daarna testen we enkele stations en kiezen we het station met
-# de beste dekking voor prcp.
+# BELANGRIJK:
+# - date = YYYY-MM-DD
+# - prcp = gemiddelde dagelijkse neerslag over stations
+# - tsun = gemiddelde dagelijkse zonneschijnduur over stations
 # ============================================================
 
-
-# ============================================================
-# INSTELLINGEN
-# ============================================================
-
+BASE_URL = "https://opendata.meteo.be/service/ows"
 SPOTIFY_DAILY_FILE = "daily_valence_summary.csv"
-OUTPUT_WEATHER_FILE = "weather.csv"
-OUTPUT_STATION_CHECK_FILE = "station_candidate_coverage.csv"
+OUTPUT_FILE = "weather.csv"
 
-RAPIDAPI_HOST = "meteostat.p.rapidapi.com"
-
-# Plak hier je eigen RapidAPI-key.
-# Voorbeeld:
-# RAPIDAPI_KEY = "abc123..."
-RAPIDAPI_KEY = "6c94cf6ca3msh149ba21fd5b0570p1bb21ejsn41d2728e6626"
-
-# Brussel als centrale Belgische locatie
-LATITUDE = 50.8503
-LONGITUDE = 4.3517
-
-# Aantal weerstations rond Brussel dat we willen testen
-STATION_LIMIT = 5
-
-# Even wachten tussen API-calls om problemen met rate limits te vermijden
-REQUEST_SLEEP_SECONDS = 1
-
-
-# ============================================================
-# CONTROLE API KEY
-# ============================================================
-
-if RAPIDAPI_KEY == "PLAK_HIER_JE_RAPIDAPI_KEY" or not RAPIDAPI_KEY.strip():
-    raise ValueError(
-        "Je hebt je RapidAPI-key nog niet ingevuld.\n"
-        "Vervang deze regel:\n"
-        'RAPIDAPI_KEY = "PLAK_HIER_JE_RAPIDAPI_KEY"\n'
-        "door je echte key."
-    )
-
-HEADERS = {
-    "x-rapidapi-key": RAPIDAPI_KEY,
-    "x-rapidapi-host": RAPIDAPI_HOST
-}
+TIMEOUT_SECONDS = 180
 
 
 # ============================================================
 # HULPFUNCTIES
 # ============================================================
 
-def get_station_name(station):
+def pick_column(df, candidates, required=True):
     """
-    Meteostat geeft station name soms als string en soms als dictionary.
-    Deze functie maakt daar een leesbare naam van.
+    Zoek case-insensitive naar een kolomnaam.
     """
-    name = station.get("name", "onbekend")
+    lower_map = {str(col).lower(): col for col in df.columns}
 
-    if isinstance(name, dict):
-        return (
-            name.get("en")
-            or name.get("nl")
-            or name.get("fr")
-            or next(iter(name.values()), "onbekend")
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in lower_map:
+            return lower_map[key]
+
+    if required:
+        raise KeyError(
+            f"Geen passende kolom gevonden.\n"
+            f"Gezochte opties: {candidates}\n"
+            f"Beschikbare kolommen: {df.columns.tolist()}"
         )
 
-    return str(name)
+    return None
 
 
-def split_date_range_by_year(start_date, end_date):
+def year_ranges(start_date, end_date):
     """
-    Splitst het datumbereik per jaar.
-    Dat is overzichtelijker en veiliger dan één zeer grote call.
+    Splitst de periode in jaarblokken.
     """
-    date_ranges = []
+    ranges = []
 
     for year in range(start_date.year, end_date.year + 1):
-        year_start = pd.Timestamp(year=year, month=1, day=1).date()
-        year_end = pd.Timestamp(year=year, month=12, day=31).date()
+        range_start = max(start_date, pd.Timestamp(year=year, month=1, day=1))
+        range_end = min(end_date, pd.Timestamp(year=year, month=12, day=31))
+        ranges.append((range_start, range_end))
 
-        range_start = max(start_date, year_start)
-        range_end = min(end_date, year_end)
-
-        date_ranges.append((range_start, range_end))
-
-    return date_ranges
+    return ranges
 
 
-def fetch_nearby_stations():
+def build_cql_filter(start_date, end_date):
     """
-    Zoekt weerstations rond Brussel.
+    Maakt een CQL-filter voor de timestamp-kolom.
+    We nemen de volledige dag mee.
     """
-    url = f"https://{RAPIDAPI_HOST}/stations/nearby"
+    start_str = pd.Timestamp(start_date).strftime("%Y-%m-%dT00:00:00")
+    end_str = pd.Timestamp(end_date).strftime("%Y-%m-%dT23:59:59")
+
+    return f"timestamp >= '{start_str}' AND timestamp <= '{end_str}'"
+
+
+def fetch_chunk(start_date, end_date):
+    """
+    Haalt één jaarblok op uit KMI.
+    """
+    cql_filter = build_cql_filter(start_date, end_date)
 
     params = {
-        "lat": LATITUDE,
-        "lon": LONGITUDE,
-        "limit": STATION_LIMIT
+        "service": "WFS",
+        "version": "2.0.0",
+        "request": "GetFeature",
+        "typenames": "aws:aws_1day",
+        "outputFormat": "csv",
+        "CQL_FILTER": cql_filter
     }
 
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        params=params,
-        timeout=30
-    )
+    print(f"\nChunk ophalen: {start_date.date()} tot {end_date.date()}")
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            "Fout bij ophalen van nabijgelegen weerstations.\n"
-            f"Status code: {response.status_code}\n"
-            f"Antwoord: {response.text}"
-        )
+    response = requests.get(BASE_URL, params=params, timeout=TIMEOUT_SECONDS)
+    response.raise_for_status()
 
-    stations = response.json().get("data", [])
+    text = response.text.strip()
 
-    if not stations:
-        raise RuntimeError("Geen weerstations gevonden rond Brussel.")
-
-    return stations
-
-
-def fetch_daily_weather_for_station(station_id, date_ranges):
-    """
-    Haalt dagelijkse weerdata op voor één station.
-    """
-    url = f"https://{RAPIDAPI_HOST}/stations/daily"
-
-    all_rows = []
-
-    for range_start, range_end in date_ranges:
-        print(f"  Weather ophalen voor station {station_id}: {range_start} tot {range_end}")
-
-        params = {
-            "station": station_id,
-            "start": str(range_start),
-            "end": str(range_end),
-            "units": "metric"
-        }
-
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            params=params,
-            timeout=60
-        )
-
-        if response.status_code != 200:
-            print(
-                f"  Fout voor station {station_id}, periode {range_start} tot {range_end}.\n"
-                f"  Status code: {response.status_code}\n"
-                f"  Antwoord: {response.text}"
-            )
-            continue
-
-        data = response.json().get("data", [])
-        all_rows.extend(data)
-
-        time.sleep(REQUEST_SLEEP_SECONDS)
-
-    weather = pd.DataFrame(all_rows)
-
-    if weather.empty:
+    if not text:
+        print("  -> Leeg antwoord")
         return pd.DataFrame()
 
-    weather["date"] = pd.to_datetime(weather["date"], errors="coerce")
-    weather = weather.dropna(subset=["date"]).copy()
-    weather["date"] = weather["date"].dt.normalize()
+    chunk = pd.read_csv(io.StringIO(text))
 
-    wanted_cols = [
-        "date",
-        "prcp",
-        "tsun",
-        "tavg",
-        "tmin",
-        "tmax",
-        "wspd",
-        "pres"
-    ]
+    print("  -> Rijen ontvangen:", len(chunk))
 
-    available_cols = [col for col in wanted_cols if col in weather.columns]
-    weather = weather[available_cols].copy()
+    if not chunk.empty:
+        print("  -> Eerste kolommen:", chunk.columns.tolist()[:10])
 
-    for col in weather.columns:
-        if col != "date":
-            weather[col] = pd.to_numeric(weather[col], errors="coerce")
-
-    weather = weather.drop_duplicates(subset=["date"])
-    weather = weather.sort_values("date").reset_index(drop=True)
-
-    return weather
+    return chunk
 
 
 # ============================================================
-# STAP 1: SPOTIFY DAGDATA INLADEN
+# STAP 1: INPUTBESTAND CONTROLEREN
 # ============================================================
 
-print("Spotify dagdata wordt ingeladen...")
+if not Path(SPOTIFY_DAILY_FILE).exists():
+    raise FileNotFoundError(
+        f"Bestand niet gevonden: {SPOTIFY_DAILY_FILE}\n"
+        "Run eerst main.py."
+    )
 
 spotify_daily = pd.read_csv(SPOTIFY_DAILY_FILE)
 
 if "date" not in spotify_daily.columns:
-    raise ValueError(
-        f"Kolom 'date' niet gevonden in {SPOTIFY_DAILY_FILE}."
-    )
+    raise ValueError(f"Kolom 'date' niet gevonden in {SPOTIFY_DAILY_FILE}")
 
 spotify_daily["date"] = pd.to_datetime(spotify_daily["date"], errors="coerce")
 spotify_daily = spotify_daily.dropna(subset=["date"]).copy()
-spotify_daily["date"] = spotify_daily["date"].dt.normalize()
 
-start_date = spotify_daily["date"].min().date()
-end_date = spotify_daily["date"].max().date()
+start_date = spotify_daily["date"].min().normalize()
+end_date = spotify_daily["date"].max().normalize()
 
-print("\nDatumbereik uit Spotify-dataset:")
-print(start_date, "tot", end_date)
-
-date_ranges = split_date_range_by_year(start_date, end_date)
-
-print("\nPeriodes die via de API worden opgehaald:")
-for s, e in date_ranges:
-    print(s, "tot", e)
+print("Analyseperiode afgeleid uit daily_valence_summary.csv:")
+print(start_date.date(), "tot", end_date.date())
 
 
 # ============================================================
-# STAP 2: WEERSTATIONS ROND BRUSSEL ZOEKEN
+# STAP 2: KMI-DATA IN CHUNKS OPHALEN
 # ============================================================
 
-print("\nWeerstations rond Brussel zoeken...")
+ranges = year_ranges(start_date, end_date)
 
-stations = fetch_nearby_stations()
+all_chunks = []
 
-stations_info = []
+for range_start, range_end in ranges:
+    chunk = fetch_chunk(range_start, range_end)
 
-print("\nGevonden stations:")
+    if not chunk.empty:
+        all_chunks.append(chunk)
 
-for station in stations:
-    station_id = str(station.get("id"))
-    station_name = get_station_name(station)
-    distance = station.get("distance", None)
+if not all_chunks:
+    raise RuntimeError("Geen weatherdata ontvangen van KMI.")
 
-    print(f"- {station_id} | {station_name} | afstand: {distance} meter")
+raw = pd.concat(all_chunks, ignore_index=True)
 
-    stations_info.append({
-        "station_id": station_id,
-        "station_name": station_name,
-        "distance_m": distance
+print("\nTotaal aantal ruwe rijen na concat:", len(raw))
+print("Aantal kolommen:", len(raw.columns))
+print("Kolommen:")
+print(raw.columns.tolist())
+
+
+# ============================================================
+# STAP 3: KOLOMMEN KIEZEN
+# ============================================================
+
+date_col = pick_column(raw, ["timestamp", "dateTime", "datetime", "date", "DATE"])
+prcp_col = pick_column(raw, ["precip_quantity", "PRECIP_QUANTITY", "prcp", "precipitation"])
+tsun_col = pick_column(raw, ["sun_duration", "SUN_DURATION", "tsun", "sunshine_duration"])
+station_col = pick_column(raw, ["code", "station_code", "name", "station", "station_name"], required=False)
+
+print("\nGeselecteerde kolommen:")
+print("date_col   =", date_col)
+print("prcp_col   =", prcp_col)
+print("tsun_col   =", tsun_col)
+print("station_col=", station_col)
+
+
+# ============================================================
+# STAP 4: TYPES CORRECT ZETTEN
+# ============================================================
+
+raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce").dt.normalize()
+raw[prcp_col] = pd.to_numeric(raw[prcp_col], errors="coerce")
+raw[tsun_col] = pd.to_numeric(raw[tsun_col], errors="coerce")
+
+if station_col is not None:
+    raw[station_col] = raw[station_col].astype(str).str.strip()
+
+print("\nRuwe minimum- en maximumdatum:")
+print(raw[date_col].min(), "tot", raw[date_col].max())
+
+print("\nAantal missende waarden vóór cleaning:")
+print(raw[[date_col, prcp_col, tsun_col]].isna().sum())
+
+
+# ============================================================
+# STAP 5: FILTEREN OP PERIODE EN DUPLICATEN WEGHALEN
+# ============================================================
+
+raw = raw[
+    (raw[date_col] >= start_date) &
+    (raw[date_col] <= end_date)
+].copy()
+
+# Duplicaten vermijden op station + datum indien mogelijk
+if station_col is not None:
+    raw = raw.drop_duplicates(subset=[station_col, date_col])
+else:
+    raw = raw.drop_duplicates(subset=[date_col, prcp_col, tsun_col])
+
+print("\nNa filtering en deduplicatie:")
+print("Shape:", raw.shape)
+print("Minimum datum:", raw[date_col].min())
+print("Maximum datum:", raw[date_col].max())
+
+
+# ============================================================
+# STAP 6: PER DAG GEMIDDELDE OVER STATIONS
+# ============================================================
+# We droppen NIET blind alle rijen zonder tsun.
+# Voor prcp is minstens 1 station nodig om een daggemiddelde te vormen.
+# ============================================================
+
+weather_daily = (
+    raw.groupby(date_col, as_index=False)
+    .agg({
+        prcp_col: "mean",
+        tsun_col: "mean"
     })
+    .copy()
+)
+
+weather_daily = weather_daily.rename(columns={
+    date_col: "date",
+    prcp_col: "prcp",
+    tsun_col: "tsun"
+})
+
+weather_daily["prcp"] = pd.to_numeric(weather_daily["prcp"], errors="coerce")
+weather_daily["tsun"] = pd.to_numeric(weather_daily["tsun"], errors="coerce")
+
+print("\nNa groeperen per dag:")
+print("Shape:", weather_daily.shape)
+print("Minimum datum:", weather_daily["date"].min())
+print("Maximum datum:", weather_daily["date"].max())
 
 
 # ============================================================
-# STAP 3: STATIONS TESTEN OP DATADEKKING
+# STAP 7: VOLLEDIGE DATUMREEKS MAKEN
+# ============================================================
+# Zo zien we exact welke dagen ontbreken, in plaats van dat
+# de dataset gewoon later lijkt te starten.
 # ============================================================
 
-print("\nStations worden getest op weather-dekking...")
+full_calendar = pd.DataFrame({
+    "date": pd.date_range(start=start_date, end=end_date, freq="D")
+})
 
-station_results = []
-weather_by_station = {}
+weather = pd.merge(
+    full_calendar,
+    weather_daily,
+    on="date",
+    how="left"
+)
 
-expected_days = spotify_daily["date"].nunique()
+weather["date"] = weather["date"].dt.strftime("%Y-%m-%d")
 
-for station in stations_info:
-    station_id = station["station_id"]
+print("\nVolledige calendar merge:")
+print("Aantal dagen totaal:", len(weather))
+print("Aantal dagen met prcp beschikbaar:", weather["prcp"].notna().sum())
+print("Aantal dagen met tsun beschikbaar:", weather["tsun"].notna().sum())
 
-    print(f"\nStation testen: {station_id} - {station['station_name']}")
+print("\nEerste 15 rijen van weather.csv:")
+print(weather.head(15).to_string(index=False))
 
-    weather = fetch_daily_weather_for_station(station_id, date_ranges)
+print("\nLaatste 15 rijen van weather.csv:")
+print(weather.tail(15).to_string(index=False))
 
-    if weather.empty:
-        station_results.append({
-            "station_id": station_id,
-            "station_name": station["station_name"],
-            "distance_m": station["distance_m"],
-            "received_days": 0,
-            "expected_days": expected_days,
-            "prcp_non_missing": 0,
-            "tsun_non_missing": 0,
-            "prcp_coverage": 0,
-            "tsun_coverage": 0
-        })
-        continue
-
-    received_days = weather["date"].nunique()
-
-    prcp_non_missing = weather["prcp"].notna().sum() if "prcp" in weather.columns else 0
-    tsun_non_missing = weather["tsun"].notna().sum() if "tsun" in weather.columns else 0
-
-    prcp_coverage = prcp_non_missing / expected_days
-    tsun_coverage = tsun_non_missing / expected_days
-
-    station_results.append({
-        "station_id": station_id,
-        "station_name": station["station_name"],
-        "distance_m": station["distance_m"],
-        "received_days": received_days,
-        "expected_days": expected_days,
-        "prcp_non_missing": prcp_non_missing,
-        "tsun_non_missing": tsun_non_missing,
-        "prcp_coverage": prcp_coverage,
-        "tsun_coverage": tsun_coverage
-    })
-
-    weather_by_station[station_id] = weather
-
-station_check = pd.DataFrame(station_results)
-
-station_check = station_check.sort_values(
-    by=["prcp_coverage", "received_days", "tsun_coverage"],
-    ascending=False
-).reset_index(drop=True)
-
-print("\nStation coverage controle:")
-print(station_check.to_string(index=False))
-
-station_check.to_csv(OUTPUT_STATION_CHECK_FILE, index=False)
-
-print(f"\nStation coverage opgeslagen als: {OUTPUT_STATION_CHECK_FILE}")
+print("\nSamenvatting van prcp en tsun:")
+print(weather[["prcp", "tsun"]].describe())
 
 
 # ============================================================
-# STAP 4: BESTE STATION KIEZEN
+# STAP 8: OPSLAAN
 # ============================================================
 
-if station_check.empty or station_check.iloc[0]["received_days"] == 0:
-    raise RuntimeError("Geen enkel station gaf bruikbare weatherdata terug.")
+weather.to_csv(OUTPUT_FILE, index=False)
 
-best_station_id = str(station_check.iloc[0]["station_id"])
-best_station_name = station_check.iloc[0]["station_name"]
-
-print("\nBeste station gekozen:")
-print("Station ID:", best_station_id)
-print("Naam:", best_station_name)
-
-weather = weather_by_station[best_station_id].copy()
-
-
-# ============================================================
-# STAP 5: WEATHERDATA CONTROLEREN EN OPSLAAN
-# ============================================================
-
-print("\nWeatherdata van gekozen station:")
-print("Aantal dagen:", len(weather))
-print("Datumbereik:")
-print(weather["date"].min(), "tot", weather["date"].max())
-
-print("\nAantal missende waarden:")
-print(weather.isna().sum())
-
-print("\nEerste 10 rijen:")
-print(weather.head(10).to_string(index=False))
-
-weather.to_csv(OUTPUT_WEATHER_FILE, index=False)
-
-print(f"\nWeatherdata opgeslagen als: {OUTPUT_WEATHER_FILE}")
-print("\nKlaar.")
+print(f"\nKlaar. Bestand opgeslagen als {OUTPUT_FILE}")
+print("Kolommen:", weather.columns.tolist())
