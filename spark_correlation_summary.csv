@@ -1,0 +1,9 @@
+left_column,right_column,row_count,pearson_correlation
+share_sad_streams,prcp,802,-0.024136283144014278
+share_sad_streams,tsun,0,
+share_sad_songs,prcp,802,0.058647627325910855
+share_sad_songs,tsun,0,
+weighted_avg_valence,prcp,802,0.07022659773051385
+weighted_avg_valence,tsun,0,
+sad_streams,prcp,802,-0.13280582808591815
+sad_streams,tsun,0,
