@@ -530,7 +530,7 @@ def merge_charts_features(charts, features_by_id, features_by_text, features_by_
     """
     Koppelt audio-features aan de charts. 
     Hier gebruiken we SQL (SQLite) om de joins efficiënt uit te voeren, 
-    wat de 'match rate' verbetert en laat zien hoe SQL in een Python-pipeline past.
+    wat de 'match rate' verbetert.
     """
     print("\nBezig met koppelen van features via SQL...")
 
@@ -542,8 +542,7 @@ def merge_charts_features(charts, features_by_id, features_by_text, features_by_
     features_by_id.to_sql("feat_id", conn, index=False)
     features_by_text.to_sql("feat_text", conn, index=False)
     
-    # De SQL Query: we proberen eerst op ID te matchen, daarna op tekst
-    # Dit is een krachtige manier om SQL te gebruiken binnen een script
+    # SQL Query: we proberen eerst op ID te matchen, daarna op tekst
     query = """
     SELECT 
         c.*, 
